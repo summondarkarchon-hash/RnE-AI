@@ -22,7 +22,7 @@ try:
 except Exception as e:
     Groq = None
     logging.warning(f'Groq import 실패: {e}')
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -114,16 +114,17 @@ if (not df_collab.empty
         PROF_BY_INST[inst] = counts
 
 # ──────────────────────────────────────────────────────
-# 3. 임베딩 모델 & 벡터 DB
+# 3. 경량 검색 인덱스 & 벡터 DB
 # ──────────────────────────────────────────────────────
-# Render 무료 인스턴스에서는 앱 시작 시 무거운 모델/임베딩을 바로 계산하면
-# 포트를 열기 전에 프로세스가 종료될 수 있으므로 lazy loading으로 처리한다.
-EMBED_MODEL_NAME = os.environ.get('EMBED_MODEL_NAME', 'paraphrase-multilingual-MiniLM-L12-v2')
-embedder = None
-EMB_DIM = 384
-emb_full = np.zeros((0, EMB_DIM))
-emb_collab = np.zeros((0, EMB_DIM))
-EQUIP_VECS: dict[str, np.ndarray] = {}
+# Render 무료 인스턴스 메모리 제한(512MB)을 피하기 위해 torch/sentence-transformers를 제거하고
+# scikit-learn TF-IDF 기반 검색으로 변경한다. 의미 임베딩보다는 가볍고 안정적이다.
+full_vectorizer = None
+collab_vectorizer = None
+equip_vectorizer = None
+emb_full = None       # sparse matrix
+emb_collab = None     # sparse matrix
+EQUIP_VECS = None     # sparse matrix
+EQUIP_INDEX: dict[str, int] = {}
 _EMBEDDINGS_READY = False
 
 def _make_text_full(row) -> str:
@@ -150,47 +151,54 @@ def _make_text_collab(row) -> str:
     if ab:    parts.append(ab[:200])
     return ' '.join(parts)
 
+def _make_vectorizer(max_features: int = 30000) -> TfidfVectorizer:
+    """한국어/영어 혼합 짧은 연구 주제에 안정적인 문자 n-gram TF-IDF."""
+    return TfidfVectorizer(
+        analyzer='char_wb',
+        ngram_range=(2, 4),
+        max_features=max_features,
+        min_df=1,
+        sublinear_tf=True,
+        lowercase=True,
+    )
+
+
 def _ensure_embeddings():
-    """임베딩 모델과 벡터 DB를 최초 분석 시 1회만 준비한다."""
-    global embedder, EMB_DIM, emb_full, emb_collab, EQUIP_VECS, _EMBEDDINGS_READY
+    """경량 TF-IDF 검색 인덱스를 최초 분석 시 1회만 준비한다."""
+    global full_vectorizer, collab_vectorizer, equip_vectorizer
+    global emb_full, emb_collab, EQUIP_VECS, EQUIP_INDEX, _EMBEDDINGS_READY
 
     if _EMBEDDINGS_READY:
         return
 
-    log.info(f'임베딩 모델 로드 중: {EMBED_MODEL_NAME}')
-    embedder = SentenceTransformer(EMBED_MODEL_NAME)
-    EMB_DIM = int(embedder.get_sentence_embedding_dimension())
-    log.info(f'모델 로드 완료 — embedding dim: {EMB_DIM}')
+    log.info('TF-IDF 검색 인덱스 생성 시작...')
 
-    log.info('전체 RnE 임베딩 시작...')
+    # 전체 RnE 검색 인덱스
     if not df_full.empty:
         df_full['_text'] = df_full.apply(_make_text_full, axis=1).fillna('').astype(str)
-        emb_full = embedder.encode(
-            df_full['_text'].tolist(),
-            batch_size=16,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        )
+        texts = df_full['_text'].tolist()
+        full_vectorizer = _make_vectorizer(max_features=30000)
+        emb_full = full_vectorizer.fit_transform(texts)
     else:
         df_full['_text'] = pd.Series(dtype=str)
-        emb_full = np.zeros((0, EMB_DIM))
+        full_vectorizer = None
+        emb_full = None
 
-    log.info('협업 RnE 임베딩 시작...')
+    # 협업 RnE 검색 인덱스
     if not df_collab.empty:
         df_collab['_text'] = df_collab.apply(_make_text_collab, axis=1).fillna('').astype(str)
-        emb_collab = embedder.encode(
-            df_collab['_text'].tolist(),
-            batch_size=16,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        )
+        texts = df_collab['_text'].tolist()
+        collab_vectorizer = _make_vectorizer(max_features=20000)
+        emb_collab = collab_vectorizer.fit_transform(texts)
     else:
         df_collab['_text'] = pd.Series(dtype=str)
-        emb_collab = np.zeros((0, EMB_DIM))
+        collab_vectorizer = None
+        emb_collab = None
 
-    log.info('기관별 연구장비 임베딩 사전 계산...')
-    EQUIP_VECS = {}
+    # 장비 검색 인덱스
     required_equip_cols = {'기관명', '유휴불용', '장비분류(중분류)', '장비분류(소분류)'}
+    equip_texts: list[str] = []
+    equip_insts: list[str] = []
 
     if not df_equip.empty and required_equip_cols.issubset(df_equip.columns):
         for _inst in DGB_INSTITUTIONS:
@@ -199,22 +207,32 @@ def _ensure_embeddings():
                 df_equip['기관명'].astype(str).str.contains(_kw, na=False, regex=False)
                 & (df_equip['유휴불용'].astype(str) == '활용')
             ]
-
             if _sub.empty:
                 continue
-
             _txt = ' '.join(
                 _sub['장비분류(중분류)'].fillna('').astype(str).tolist()
                 + _sub['장비분류(소분류)'].fillna('').astype(str).tolist()
-            )
-
-            if _txt.strip():
-                EQUIP_VECS[_inst] = embedder.encode([_txt], normalize_embeddings=True)
+            ).strip()
+            if _txt:
+                equip_insts.append(_inst)
+                equip_texts.append(_txt)
     else:
         log.warning(f'장비 데이터 컬럼 불일치 또는 빈 파일. 현재 컬럼: {df_equip.columns.tolist()}')
 
+    if equip_texts:
+        equip_vectorizer = _make_vectorizer(max_features=12000)
+        EQUIP_VECS = equip_vectorizer.fit_transform(equip_texts)
+        EQUIP_INDEX = {inst: i for i, inst in enumerate(equip_insts)}
+    else:
+        equip_vectorizer = None
+        EQUIP_VECS = None
+        EQUIP_INDEX = {}
+
     _EMBEDDINGS_READY = True
-    log.info(f'임베딩 준비 완료 — 전체:{len(emb_full)} 협업:{len(emb_collab)} 장비기관:{len(EQUIP_VECS)}')
+    full_n = emb_full.shape[0] if emb_full is not None else 0
+    collab_n = emb_collab.shape[0] if emb_collab is not None else 0
+    equip_n = EQUIP_VECS.shape[0] if EQUIP_VECS is not None else 0
+    log.info(f'TF-IDF 준비 완료 — 전체:{full_n} 협업:{collab_n} 장비기관:{equip_n}')
 
 # ──────────────────────────────────────────────────────
 # 4. 기관 정보 매핑
@@ -412,56 +430,47 @@ def search_papers(topic: str, total: int = 6) -> list[dict]:
     """
     논문 검색 파이프라인:
     ① 한국어 → 영어 번역
-    ② Semantic Scholar + OpenAlex API 검색 (각 12건)
+    ② Semantic Scholar + OpenAlex API 검색
     ③ 중복 제거
-    ④ 한·영 이중 임베딩 평균으로 재순위화
-    ⑤ 관련도 임계값 (0.20) 미만 제거
-    ⑥ 상위 total건 반환
+    ④ TF-IDF 문자 n-gram으로 경량 재순위화
+    ⑤ 상위 total건 반환
     """
     en_kw = _translate_to_english(topic)
     log.info(f'논문 검색 키워드: {en_kw}')
 
-    raw  = _search_semantic_scholar(en_kw, limit=12)
+    raw = _search_semantic_scholar(en_kw, limit=12)
     time.sleep(0.4)
     raw += _search_openalex(en_kw, limit=12)
 
-    # 중복 제거 (제목 앞 40자 기준)
     seen: set[str] = set()
     unique: list[dict] = []
     for r in raw:
-        key = r['title'].lower()[:40]
-        if key not in seen:
+        key = str(r.get('title', '')).lower()[:40]
+        if key and key not in seen:
             seen.add(key)
             unique.append(r)
 
     if not unique:
         return [{
-            'source':   '검색 없음', 'title': f'관련 논문을 찾지 못했습니다 (키워드: {en_kw})',
-            'authors':  '-', 'year': '-',
-            'abstract': '다른 표현으로 주제를 입력해보거나 잠시 후 다시 시도해주세요.', 'url': '',
+            'source': '검색 없음',
+            'title': f'관련 논문을 찾지 못했습니다 (키워드: {en_kw})',
+            'authors': '-', 'year': '-',
+            'abstract': '다른 표현으로 주제를 입력해보거나 잠시 후 다시 시도해주세요.',
+            'url': '',
         }]
 
-    # 한·영 이중 임베딩으로 재순위화
-    tv_ko = embedder.encode([topic],   normalize_embeddings=True)
-    tv_en = embedder.encode([en_kw],   normalize_embeddings=True)
-    tv    = (tv_ko + tv_en) / 2
-    norm  = np.linalg.norm(tv)
-    if norm > 0:
-        tv /= norm
+    try:
+        query = f'{topic} {en_kw}'
+        texts = [str(r.get('_full_text', '')) for r in unique]
+        v = _make_vectorizer(max_features=12000)
+        mat = v.fit_transform([query] + texts)
+        sims = cosine_similarity(mat[0], mat[1:])[0]
+        ranked = sorted(zip(unique, sims.tolist()), key=lambda x: x[1], reverse=True)
+    except Exception as e:
+        log.warning(f'논문 TF-IDF 재순위화 실패: {e}')
+        ranked = [(r, 0.0) for r in unique]
 
-    texts  = [r['_full_text'] for r in unique]
-    pvecs  = embedder.encode(texts, normalize_embeddings=True)
-    sims   = cosine_similarity(tv, pvecs)[0]
-
-    ranked = sorted(zip(unique, sims.tolist()), key=lambda x: x[1], reverse=True)
-
-    # 관련도 임계값 필터
-    filtered = [(r, s) for r, s in ranked if s >= _PAPER_RELEVANCE_THRESHOLD]
-    if not filtered:
-        # 임계값 초과 없으면 상위 total건 그냥 반환 (검색 결과 자체가 없는 극단 상황)
-        filtered = ranked
-
-    top = [r for r, _ in filtered[:total]]
+    top = [r for r, _ in ranked[:total]]
     for r in top:
         r.pop('_full_text', None)
     return top
@@ -472,14 +481,10 @@ def search_rne_similar(
     field_filter: str = '전체',
     top_k: int = 5,
 ) -> pd.DataFrame:
-    """
-    전체 RnE 1,357건에서 유사 주제 검색
-    - field_filter: '전체' 또는 분야명
-    - 빈 텍스트 항목 제외
-    - 결과: 한글 컬럼명 DataFrame
-    """
-    if df_full.empty or len(emb_full) == 0:
-        return pd.DataFrame(columns=['연도', '분야', '제목', '소속고등학교', '주제어', '유사도(%)'])
+    """전체 RnE 데이터에서 TF-IDF 기반 유사 주제 검색."""
+    empty_cols = ['연도', '분야', '제목', '소속고등학교', '주제어', '유사도(%)']
+    if df_full.empty or emb_full is None or full_vectorizer is None:
+        return pd.DataFrame(columns=empty_cols)
 
     df = df_full.copy()
     if field_filter and field_filter != '전체' and 'subject' in df.columns:
@@ -487,25 +492,22 @@ def search_rne_similar(
         if not sub.empty:
             df = sub
 
-    # 빈 텍스트 행 사전 제거
     if '_text' not in df.columns:
         df['_text'] = df.apply(_make_text_full, axis=1).fillna('').astype(str)
-    nonempty_mask = df['_text'].fillna('').astype(str).str.strip() != ''
-    df = df[nonempty_mask]
+    df = df[df['_text'].fillna('').astype(str).str.strip() != '']
     if df.empty:
-        return pd.DataFrame(columns=['연도', '분야', '제목', '소속고등학교', '주제어', '유사도(%)'])
+        return pd.DataFrame(columns=empty_cols)
 
-    idxs = [int(i) for i in df.index.tolist() if int(i) < len(emb_full)]
+    idxs = [int(i) for i in df.index.tolist() if int(i) < emb_full.shape[0]]
     if not idxs:
-        return pd.DataFrame(columns=['연도', '분야', '제목', '소속고등학교', '주제어', '유사도(%)'])
-    df = df.loc[idxs]
-    sub_emb = emb_full[idxs]
-    tv       = embedder.encode([topic], normalize_embeddings=True)
-    sims     = cosine_similarity(tv, sub_emb)[0]
+        return pd.DataFrame(columns=empty_cols)
 
-    # 상위 top_k 선택 (df.iloc 기준 위치 인덱스)
-    top_pos  = sims.argsort()[::-1][:top_k]
-    result   = df.iloc[top_pos].copy()
+    df = df.loc[idxs]
+    tv = full_vectorizer.transform([topic])
+    sims = cosine_similarity(tv, emb_full[idxs])[0]
+
+    top_pos = sims.argsort()[::-1][:top_k]
+    result = df.iloc[top_pos].copy()
     result['유사도(%)'] = np.round(sims[top_pos] * 100, 1)
 
     col_map = {
@@ -513,14 +515,14 @@ def search_rne_similar(
         'school': '소속고등학교', 'keywords': '주제어',
     }
     result = result.rename(columns=col_map)
-    show   = [c for c in [*col_map.values(), '유사도(%)'] if c in result.columns]
+    show = [c for c in [*col_map.values(), '유사도(%)'] if c in result.columns]
     return result[show].reset_index(drop=True)
 
 # ──────────────────────────────────────────────────────
 # 6. 기관 적합도 스코어링
 # ──────────────────────────────────────────────────────
 
-# 장비 임베딩은 _ensure_embeddings()에서 lazy loading으로 계산한다.
+# 장비 TF-IDF 인덱스는 _ensure_embeddings()에서 lazy loading으로 계산한다.
 
 
 def _field_bonus(inst: str, topic: str) -> float:
@@ -536,11 +538,17 @@ def _field_bonus(inst: str, topic: str) -> float:
     return 0.0
 
 
-def _equip_score(topic_vec: np.ndarray, inst: str) -> float:
-    """장비 임베딩 유사도 — 사전 계산된 EQUIP_VECS 사용"""
-    if inst not in EQUIP_VECS:
+def _equip_score(topic: str, inst: str) -> float:
+    """장비 텍스트 TF-IDF 유사도."""
+    if equip_vectorizer is None or EQUIP_VECS is None or inst not in EQUIP_INDEX:
         return 0.0
-    return float(np.clip(cosine_similarity(topic_vec, EQUIP_VECS[inst])[0][0], 0.0, 1.0))
+    try:
+        tv = equip_vectorizer.transform([topic])
+        row = EQUIP_VECS[EQUIP_INDEX[inst]]
+        return float(np.clip(cosine_similarity(tv, row)[0][0], 0.0, 1.0))
+    except Exception as e:
+        log.warning(f'장비 점수 계산 실패({inst}): {e}')
+        return 0.0
 
 
 def _rnd_count(inst: str) -> int:
@@ -558,30 +566,27 @@ def _rank_normalize(series: pd.Series) -> pd.Series:
 
 def calculate_scores(topic: str) -> pd.DataFrame:
     """
-    기관별 적합도 계산 — rank 기반 정규화로 POSTECH 독점 현상 해결
+    기관별 적합도 계산 — TF-IDF 기반 경량 버전.
     가중치:
-      연구분야 일치도  40%  — 기관 RnE Top-3 유사도 평균, rank 정규화
-      RnE 실적        25%  — log(건수+1), rank 정규화
-      기자재 매칭      20%  — 장비 텍스트 임베딩 유사도, rank 정규화
-      연구재단 역량    10%  — log(과제수+1), rank 정규화
-      분야 가산점       5%  — 2개+ 키워드 일치 시 0.10 (rank 정규화 없이 직접 가산)
-    → Softmax (temperature=4.0) → %
+      연구분야 일치도 40%, RnE 실적 25%, 기자재 20%, 연구재단 역량 10%, 분야 가산점 5%
     """
-    tv = embedder.encode([topic], normalize_embeddings=True)
-
     rows = []
+
+    if collab_vectorizer is not None:
+        tv = collab_vectorizer.transform([topic])
+    else:
+        tv = None
+
     for inst in DGB_INSTITUTIONS:
         if not df_collab.empty and '협력대학기관' in df_collab.columns:
             ir = df_collab[df_collab['협력대학기관'] == inst]
         else:
             ir = pd.DataFrame()
 
-        # ① 연구분야 일치도 — Top-3 유사 논문 평균
-        if not ir.empty and len(emb_collab) > 0:
-            idxs = [int(i) for i in ir.index.tolist() if int(i) < len(emb_collab)]
+        if tv is not None and not ir.empty and emb_collab is not None:
+            idxs = [int(i) for i in ir.index.tolist() if int(i) < emb_collab.shape[0]]
             if idxs:
-                ivecs = emb_collab[idxs]
-                sim_arr = cosine_similarity(tv, ivecs)[0]
+                sim_arr = cosine_similarity(tv, emb_collab[idxs])[0]
                 top3 = float(np.sort(sim_arr)[::-1][:3].mean())
             else:
                 top3 = 0.0
@@ -589,33 +594,28 @@ def calculate_scores(topic: str) -> pd.DataFrame:
             top3 = 0.0
 
         rows.append({
-            '기관명':    inst,
+            '기관명': inst,
             'RnE실적수': len(ir),
-            '_field':   top3,
-            '_rne':     float(np.log1p(len(ir))),
-            '_equip':   _equip_score(tv, inst),
-            '_rnd':     float(np.log1p(_rnd_count(inst))),
-            '_bonus':   _field_bonus(inst, topic),
+            '_field': top3,
+            '_rne': float(np.log1p(len(ir))),
+            '_equip': _equip_score(topic, inst),
+            '_rnd': float(np.log1p(_rnd_count(inst))),
+            '_bonus': _field_bonus(inst, topic),
         })
 
     df_s = pd.DataFrame(rows)
-
-    # Rank 백분위 정규화 (각 항목 독립)
     for col in ['_field', '_rne', '_equip', '_rnd']:
         df_s[col + '_r'] = _rank_normalize(df_s[col])
 
-    # 가중 합산
     df_s['raw'] = (
         df_s['_field_r'] * 0.40
-        + df_s['_rne_r']   * 0.25
+        + df_s['_rne_r'] * 0.25
         + df_s['_equip_r'] * 0.20
-        + df_s['_rnd_r']   * 0.10
-        + df_s['_bonus']   * 0.05   # 가산점은 rank 없이 직접 적용
+        + df_s['_rnd_r'] * 0.10
+        + df_s['_bonus'] * 0.05
     )
 
-    # Softmax (temperature=4.0 → 완만한 분포)
-    raw_arr = df_s['raw'].to_numpy(dtype=float)
-    raw_arr = raw_arr / 4.0
+    raw_arr = df_s['raw'].to_numpy(dtype=float) / 4.0
     exp_arr = np.exp(raw_arr - raw_arr.max())
     df_s['적합도(%)'] = (exp_arr / exp_arr.sum() * 100).round(1)
 
