@@ -13,11 +13,15 @@ Version: 2.0 (Final)
   - 전체 예외 처리 강화
 """
 
-import os, re, time, requests, tempfile, logging
+import os, re, time, requests, tempfile, logging, traceback
 import pandas as pd
 import numpy as np
 import gradio as gr
-from groq import Groq
+try:
+    from groq import Groq
+except Exception as e:
+    Groq = None
+    logging.warning(f'Groq import 실패: {e}')
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -28,8 +32,32 @@ log = logging.getLogger(__name__)
 # 1. API 설정
 # ──────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
-groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-GROQ_MODEL   = 'llama-3.3-70b-versatile'
+GROQ_MODEL   = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+groq_client = None
+_GROQ_INIT_TRIED = False
+
+def _get_groq_client():
+    """Groq 클라이언트를 필요할 때만 생성한다.
+    의존성 충돌이 있어도 앱 시작 자체가 죽지 않도록 방어한다.
+    """
+    global groq_client, _GROQ_INIT_TRIED
+    if groq_client is not None:
+        return groq_client
+    if _GROQ_INIT_TRIED:
+        return None
+    _GROQ_INIT_TRIED = True
+    if not GROQ_API_KEY:
+        log.warning('GROQ_API_KEY가 설정되지 않았습니다.')
+        return None
+    if Groq is None:
+        log.warning('groq 패키지를 import하지 못했습니다.')
+        return None
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        return groq_client
+    except Exception as e:
+        log.error(f'Groq 클라이언트 생성 실패: {e}')
+        return None
 
 SYSTEM_PROMPT = (
     "당신은 과학영재 R&E(Research and Education) 프로그램 전문 멘토입니다. "
@@ -247,11 +275,12 @@ _PAPER_RELEVANCE_THRESHOLD = 0.20   # 이 값 미만이면 무관련 논문으�
 
 def _call_groq(prompt: str, max_tokens: int = 1500, retries: int = 3) -> str:
     """Groq API 호출 (재시도 로직 포함)"""
-    if not groq_client:
-        return '❌ GROQ_API_KEY가 설정되지 않았습니다. Space Settings → Secrets를 확인해주세요.'
+    client = _get_groq_client()
+    if not client:
+        return '❌ GROQ_API_KEY 설정 또는 Groq 클라이언트 초기화에 문제가 있습니다. Render Environment와 requirements.txt를 확인해주세요.'
     for attempt in range(retries):
         try:
-            res = groq_client.chat.completions.create(
+            res = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
                     {'role': 'system', 'content': SYSTEM_PROMPT},
@@ -270,10 +299,11 @@ def _call_groq(prompt: str, max_tokens: int = 1500, retries: int = 3) -> str:
 
 def _translate_to_english(topic: str) -> str:
     """한국어 연구 주제 → 영어 학술 키워드 (Groq 사용, 실패 시 원본 반환)"""
-    if not groq_client:
+    client = _get_groq_client()
+    if not client:
         return topic
     try:
-        res = groq_client.chat.completions.create(
+        res = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{'role': 'user', 'content':
                 f'다음 한국어 연구 주제를 학술 논문 검색에 적합한 영어 키워드 4~6개로 변환해줘. '
@@ -739,51 +769,60 @@ def make_report(
 # 9. 메인 분석 파이프라인
 # ──────────────────────────────────────────────────────
 
+def _safe_empty_outputs(msg: str):
+    empty = pd.DataFrame()
+    return empty, empty, msg, empty, msg, msg, None, pd.DataFrame()
+
+
 def run_analysis(topic: str, field_filter: str):
     topic = (topic or '').strip()
     if len(topic) < 5:
-        empty = pd.DataFrame()
-        msg   = '⚠️ 연구 주제를 5자 이상 구체적으로 입력해주세요.'
-        return empty, empty, msg, empty, msg, msg, None, pd.DataFrame()
+        return _safe_empty_outputs('⚠️ 연구 주제를 5자 이상 구체적으로 입력해주세요.')
 
-    log.info(f'분석 시작: {topic[:50]}')
-    _ensure_embeddings()
+    try:
+        log.info(f'분석 시작: {topic[:50]}')
+        _ensure_embeddings()
 
-    # ① 논문 검색 (번역 → API → 임베딩 재순위화)
-    papers = search_papers(topic, total=6)
-    df_papers = pd.DataFrame(papers)
-    for col in ['source', 'title', 'authors', 'year', 'abstract', 'url']:
-        if col not in df_papers.columns:
-            df_papers[col] = ''
-    df_papers = df_papers[['source', 'title', 'authors', 'year', 'abstract', 'url']]
-    df_papers.columns = ['출처', '논문 제목', '저자', '연도', '초록(요약)', '원문 링크']
+        # ① 논문 검색 (번역 → API → 임베딩 재순위화)
+        papers = search_papers(topic, total=6)
+        df_papers = pd.DataFrame(papers)
+        for col in ['source', 'title', 'authors', 'year', 'abstract', 'url']:
+            if col not in df_papers.columns:
+                df_papers[col] = ''
+        df_papers = df_papers[['source', 'title', 'authors', 'year', 'abstract', 'url']]
+        df_papers.columns = ['출처', '논문 제목', '저자', '연도', '초록(요약)', '원문 링크']
 
-    # ② 유사 RnE 검색 (전체 1,357건 DB)
-    rne_sim = search_rne_similar(topic, field_filter, top_k=5)
+        # ② 유사 RnE 검색 (전체 1,357건 DB)
+        rne_sim = search_rne_similar(topic, field_filter, top_k=5)
 
-    # ③ AI 피드백 (Groq)
-    feedback = gen_feedback(topic, papers, rne_sim)
-    time.sleep(1)    # Groq rate limit 방지
+        # ③ AI 피드백 (Groq)
+        feedback = gen_feedback(topic, papers, rne_sim)
+        time.sleep(1)    # Groq rate limit 방지
 
-    # ④ 기관 적합도 (rank 정규화 + softmax)
-    scores   = calculate_scores(topic)
+        # ④ 기관 적합도 (rank 정규화 + softmax)
+        scores = calculate_scores(topic)
 
-    # ⑤ RnE 진행 가이드
-    top_inst = scores.iloc[0]['기관명'] if not scores.empty else '경북대학교'
-    guide    = gen_guide(topic, top_inst)
-    time.sleep(1)
+        # ⑤ RnE 진행 가이드
+        top_inst = scores.iloc[0]['기관명'] if not scores.empty else '경북대학교'
+        guide = gen_guide(topic, top_inst)
+        time.sleep(1)
 
-    # ⑥ 연구 계획서 초안
-    plan     = gen_plan(topic, feedback, top_inst)
+        # ⑥ 연구 계획서 초안
+        plan = gen_plan(topic, feedback, top_inst)
 
-    # ⑦ 교수 TOP5
-    prof_df  = PROF_BY_INST.get(top_inst, pd.DataFrame(columns=['교수명', '협업횟수']))
+        # ⑦ 교수 TOP5
+        prof_df = PROF_BY_INST.get(top_inst, pd.DataFrame(columns=['교수명', '협업횟수']))
 
-    # ⑧ 결과 txt 파일
-    dl_path  = make_report(topic, papers, rne_sim, feedback, scores, guide, plan)
+        # ⑧ 결과 txt 파일
+        dl_path = make_report(topic, papers, rne_sim, feedback, scores, guide, plan)
 
-    log.info('분석 완료')
-    return df_papers, rne_sim, feedback, scores, guide, plan, dl_path, prof_df
+        log.info('분석 완료')
+        return df_papers, rne_sim, feedback, scores, guide, plan, dl_path, prof_df
+
+    except Exception as e:
+        log.error('분석 중 예외 발생:\n' + traceback.format_exc())
+        msg = f'❌ 분석 중 오류가 발생했습니다. 로그를 확인해주세요.\n\n오류: {type(e).__name__}: {e}'
+        return _safe_empty_outputs(msg)
 
 # ──────────────────────────────────────────────────────
 # 10. Gradio UI
