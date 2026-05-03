@@ -89,7 +89,7 @@ if (not df_collab.empty
 # 3. 임베딩 모델 & 벡터 DB
 # ──────────────────────────────────────────────────────
 log.info('임베딩 모델 로드 중...')
-embedder = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
+embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 log.info('모델 로드 완료')
 
 def _make_text_full(row) -> str:
@@ -118,17 +118,21 @@ def _make_text_collab(row) -> str:
 
 log.info('전체 RnE 임베딩 시작...')
 df_full['_text']   = df_full.apply(_make_text_full, axis=1)
-emb_full = embedder.encode(
-    df_full['_text'].tolist(), batch_size=32,
-    show_progress_bar=True, normalize_embeddings=True
-) if not df_full.empty else np.zeros((0, 768))
+EMB_DIM = embedder.get_sentence_embedding_dimension()
 
-log.info('협업 RnE 임베딩 시작...')
-df_collab['_text'] = df_collab.apply(_make_text_collab, axis=1)
+emb_full = embedder.encode(
+    df_full['_text'].tolist(),
+    batch_size=16,
+    show_progress_bar=False,
+    normalize_embeddings=True
+) if not df_full.empty else np.zeros((0, EMB_DIM))
+
 emb_collab = embedder.encode(
-    df_collab['_text'].tolist(), batch_size=32,
-    show_progress_bar=True, normalize_embeddings=True
-) if not df_collab.empty else np.zeros((0, 768))
+    df_collab['_text'].tolist(),
+    batch_size=16,
+    show_progress_bar=False,
+    normalize_embeddings=True
+) if not df_collab.empty else np.zeros((0, EMB_DIM))
 
 log.info('임베딩 완료!')
 
@@ -432,13 +436,31 @@ def search_rne_similar(
 # 시작 시 기관별 장비 텍스트 임베딩 사전 계산 (분석 시 재계산 방지)
 log.info('기관별 연구장비 임베딩 사전 계산...')
 EQUIP_VECS: dict[str, np.ndarray] = {}
-if not df_equip.empty:
+
+required_equip_cols = {'기관명', '유휴불용', '장비분류(중분류)', '장비분류(소분류)'}
+
+if not df_equip.empty and required_equip_cols.issubset(df_equip.columns):
     for _inst in DGB_INSTITUTIONS:
-        _kw  = INST_EQUIP_KW.get(_inst, _inst[:4])
+        _kw = INST_EQUIP_KW.get(_inst, _inst[:4])
         _sub = df_equip[
-            df_equip['기관명'].str.contains(_kw, na=False, regex=False)
-            & (df_equip['유휴불용'] == '활용')
+            df_equip['기관명'].astype(str).str.contains(_kw, na=False, regex=False)
+            & (df_equip['유휴불용'].astype(str) == '활용')
         ]
+
+        if _sub.empty:
+            continue
+
+        _txt = ' '.join(
+            _sub['장비분류(중분류)'].fillna('').astype(str).tolist()
+            + _sub['장비분류(소분류)'].fillna('').astype(str).tolist()
+        )
+
+        if _txt.strip():
+            EQUIP_VECS[_inst] = embedder.encode([_txt], normalize_embeddings=True)
+else:
+    log.warning(f'장비 데이터 컬럼 불일치 또는 빈 파일. 현재 컬럼: {df_equip.columns.tolist()}')
+
+log.info(f'장비 임베딩 완료: {len(EQUIP_VECS)}개 기관')
         if _sub.empty:
             continue
         _txt = ' '.join(
