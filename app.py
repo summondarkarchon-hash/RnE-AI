@@ -123,7 +123,38 @@ else:
 log.info("기관 목록 %d개 파생 완료", len(ALL_INSTITUTIONS))
 
 # ─────────────────────────────────────────────
-# 연도별 트렌드 테이블 (소개 탭용)
+# 분야 추론 함수 (기관 스코어링 가산점용)
+# ─────────────────────────────────────────────
+_FIELD_INFER: list[tuple[str, list[str]]] = [
+    ("생명과학", ["광합성", "세균", "유전자", "식물", "효소", "세포", "단백질", "dna", "바이러스",
+                  "미생물", "생태", "진화", "면역", "호르몬", "신경", "뇌"]),
+    ("물리",     ["힘", "속도", "전류", "광학", "파동", "역학", "전자기", "양자", "나노",
+                  "열역학", "마찰", "중력", "전압", "자기", "레이저", "광자"]),
+    ("수학",     ["함수", "확률", "통계", "행렬", "최적화", "방정식", "수열", "급수",
+                  "위상", "정수론", "조합", "기하"]),
+    ("정보",     ["ai", "ml", "머신러닝", "딥러닝", "알고리즘", "데이터", "분류",
+                  "신경망", "강화학습", "자연어", "컴퓨터", "소프트웨어"]),
+    ("화학",     ["분자", "반응", "합성", "촉매", "결합", "원소", "고분자", "소재",
+                  "산화", "환원", "전해질", "유기", "무기"]),
+    ("지구과학", ["대기", "해양", "지진", "기후", "천체", "우주", "행성", "지질",
+                  "날씨", "화산", "태풍", "빙하"]),
+    ("에너지",   ["태양전지", "연료전지", "배터리", "재생에너지", "태양광", "수소", "발전"]),
+    ("융합",     ["융합", "복합", "다학제", "iot", "스마트"]),
+]
+
+def _infer_field_from_text(text: str) -> str:
+    """텍스트에서 분야 추론 (규칙 기반, 경량)"""
+    t = (text or "").lower()
+    for field, kws in _FIELD_INFER:
+        if sum(1 for k in kws if k in t) >= 2:
+            return field
+    for field, kws in _FIELD_INFER:
+        if any(k in t for k in kws[:4]):
+            return field
+    return "미분류"
+
+# ─────────────────────────────────────────────
+# 연도별 트렌드 테이블 (정제된 CSV 그대로 사용)
 # ─────────────────────────────────────────────
 try:
     TREND_DF: pd.DataFrame = (
@@ -134,6 +165,7 @@ try:
         .rename(columns={"year": "연도"})
     ) if not df_full.empty else pd.DataFrame()
     TREND_DF.columns.name = None
+    log.info("TREND_DF 생성 완료: %d행", len(TREND_DF))
 except Exception as e:
     log.warning("트렌드 DF 생성 실패: %s", e)
     TREND_DF = pd.DataFrame()
@@ -157,16 +189,16 @@ if (
 # TF-IDF 벡터라이저 구성 (전역 1회)
 # ─────────────────────────────────────────────
 def _make_rne_text(row: pd.Series) -> str:
-    """RnE 레코드를 검색용 텍스트로 변환 (가중치: 제목·키워드 2배)"""
+    """RnE 레코드를 검색용 텍스트로 변환 (키워드 3배 가중)"""
     parts: list[str] = []
-    title   = str(row.get("title", "") or row.get("제목", "") or "").strip()
-    kw      = str(row.get("keywords", "") or row.get("주제어", "") or "").strip()
-    subj    = str(row.get("subject", "") or row.get("분야", "") or "").strip()
-    abstract = str(row.get("abstract", "") or row.get("연구요약", "") or "").strip()
-    if subj:     parts.append(subj)
-    if title:    parts += [title, title]       # 2배
-    if kw:       parts += [kw, kw]            # 2배
-    if abstract: parts.append(abstract[:200])
+    subj  = str(row.get("subject", "") or "").strip()
+    title = str(row.get("title", "") or "").strip()
+    kw    = str(row.get("keywords", "") or "").strip()
+    ab    = str(row.get("abstract", "") or "").strip()
+    if subj:  parts.append(subj)
+    if title: parts += [title, title]        # 2배
+    if kw:    parts += [kw, kw, kw]          # 3배 (키워드 강조)
+    if ab:    parts.append(ab[:200])
     return " ".join(parts)
 
 
@@ -411,12 +443,68 @@ def search_papers(topic: str, total: int = 6) -> list[dict]:
 # ─────────────────────────────────────────────
 # 유사 R&E 검색 (TF-IDF)
 # ─────────────────────────────────────────────
+def _extract_keywords_fast(topic: str) -> list[str]:
+    """
+    Groq 없이 규칙 기반 키워드 추출 (빠른 fallback)
+    2글자 이상 한국어 명사 토큰 + 영어 단어 추출
+    """
+    ko_words = re.findall(r"[가-힣]{2,}", topic)
+    en_words = re.findall(r"[a-zA-Z]{3,}", topic.lower())
+    return list(dict.fromkeys(ko_words + en_words))  # 순서 유지 중복 제거
+
+
+def _extract_keywords_llm(topic: str) -> list[str]:
+    """Groq로 핵심 키워드 추출 (실패 시 규칙 기반 fallback)"""
+    if not GROQ_API_KEY:
+        return _extract_keywords_fast(topic)
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        res = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content":
+                f"다음 연구 주제에서 핵심 키워드 5~12개를 추출해줘. "
+                f"한국어 키워드를 쉼표로 구분해서만 출력하고 설명은 하지 마.\n\n주제: {topic}"
+            }],
+            max_tokens=120, temperature=0.1,
+        )
+        raw = res.choices[0].message.content.strip()
+        kws = [k.strip() for k in re.split(r"[,，\n]", raw) if k.strip()]
+        return kws if kws else _extract_keywords_fast(topic)
+    except Exception:
+        return _extract_keywords_fast(topic)
+
+
+def _keyword_overlap_score(kws: list[str], text: str) -> float:
+    """키워드 집합과 텍스트 간 겹침 비율 (0~1)"""
+    if not kws or not text:
+        return 0.0
+    t = text.lower()
+    hits = sum(1 for k in kws if k.lower() in t)
+    return hits / len(kws)
+
+
+def _field_match_score(topic_kws: list[str], row_subject: str) -> float:
+    """주제 키워드와 데이터 분야 일치 여부"""
+    if not row_subject or row_subject == "미분류":
+        return 0.0
+    inferred = _infer_field_from_text(" ".join(topic_kws))
+    return 1.0 if inferred == row_subject else 0.0
+
+
 def search_rne_similar(
     topic: str,
     field_filter: str = "전체",
     top_k: int = 5,
 ) -> pd.DataFrame:
-    """전국 RnE 데이터베이스에서 TF-IDF 유사 검색"""
+    """
+    전국 RnE 데이터베이스에서 키워드 가중 혼합 유사도 검색
+    final_similarity =
+        0.45 * keyword_overlap
+      + 0.25 * tfidf_similarity
+      + 0.20 * field_match
+      + 0.10 * method_keyword_overlap
+    """
     _init_tfidf()
 
     empty_cols = ["연도", "분야", "제목", "소속고등학교", "주제어", "유사도(%)"]
@@ -425,27 +513,54 @@ def search_rne_similar(
 
     try:
         df = _valid_full.copy()
+
+        # 분야 필터
+        subj_col = "subject"
         if field_filter and field_filter != "전체":
-            sub = df[df.get("subject", df.get("분야", pd.Series())) == field_filter]
+            sub = df[df[subj_col] == field_filter]
             if not sub.empty:
                 df = sub
 
-        tv  = _tfidf_full.transform([topic])
-        if field_filter != "전체" and len(df) < len(_valid_full):
-            # 필터된 서브셋 재계산
-            sub_texts = df["_text"].tolist()
-            vec2 = TfidfVectorizer(max_features=8000, sublinear_tf=True)
-            mat2 = vec2.fit_transform(sub_texts)
+        # ① TF-IDF 유사도
+        if len(df) < len(_valid_full):
+            # 서브셋 재계산
+            vec2 = TfidfVectorizer(max_features=6000, sublinear_tf=True)
+            mat2 = vec2.fit_transform(df["_text"].tolist())
             tv2  = vec2.transform([topic])
-            sims = cosine_similarity(tv2, mat2)[0]
-            top_idx = sims.argsort()[::-1][:top_k]
-            result = df.iloc[top_idx].copy()
-            result["유사도(%)"] = np.round(sims[top_idx] * 100, 1)
+            tfidf_sims = cosine_similarity(tv2, mat2)[0]
         else:
-            sims = cosine_similarity(tv, _matrix_full)[0]
-            top_idx = sims.argsort()[::-1][:top_k]
-            result = _valid_full.iloc[top_idx].copy()
-            result["유사도(%)"] = np.round(sims[top_idx] * 100, 1)
+            tv = _tfidf_full.transform([topic])
+            tfidf_sims = cosine_similarity(tv, _matrix_full)[0]
+
+        # ② 키워드 추출 (LLM → fallback)
+        topic_kws = _extract_keywords_llm(topic)
+        log.info("추출된 키워드: %s", topic_kws)
+
+        # ③ 혼합 유사도 계산
+        mixed_sims = np.zeros(len(df))
+        for i, (_, row) in enumerate(df.iterrows()):
+            row_text    = str(row.get("_text", ""))
+            row_kw_text = str(row.get("keywords", "") or "")
+            row_subj    = str(row.get(subj_col, "") or "")
+
+            kw_score     = _keyword_overlap_score(topic_kws, row_text)
+            field_score  = _field_match_score(topic_kws, row_subj)
+            # 방법론/재료 키워드 (keywords 컬럼만 대상)
+            method_score = _keyword_overlap_score(topic_kws, row_kw_text)
+
+            mixed_sims[i] = (
+                0.45 * kw_score
+                + 0.25 * tfidf_sims[i]
+                + 0.20 * field_score
+                + 0.10 * method_score
+            )
+
+        # ④ 상위 top_k 선택
+        top_idx = mixed_sims.argsort()[::-1][:top_k]
+        result  = df.iloc[top_idx].copy()
+        # 0~100 스케일로 정규화 (최댓값 기준)
+        max_sim = mixed_sims[top_idx[0]] if mixed_sims[top_idx[0]] > 0 else 1.0
+        result["유사도(%)"] = np.round(mixed_sims[top_idx] / max_sim * 100, 1)
 
         col_map = {
             "year": "연도", "subject": "분야", "title": "제목",
