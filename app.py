@@ -989,7 +989,11 @@ with gr.Blocks(css=_CSS, title="RnE 연구 도우미 AI") as demo:
             gr.Markdown("_가중치: 연구분야 40% + RnE실적 25% + 연구재단역량 20% + 분야가산점 10% + 장비키워드 5%_")
             out_scores = gr.Dataframe(headers=["기관명", "적합도(%)", "RnE실적수"], wrap=True, row_count=15)
             gr.Markdown("### 🎓 1위 기관 협업 교수 TOP 5")
-out_prof = gr.Dataframe(value=pd.DataFrame(), headers=["교수명", "협업횟수"], wrap=True, row_count=5)
+out_prof = gr.Dataframe(
+        headers=["교수명", "협업횟수"],
+        wrap=True,
+        row_count=5
+)
         with gr.Tab("📋 4단계 · RnE 진행 가이드"):
             gr.Markdown("### 적합도 1위 기관 기준 단계별 RnE 진행 절차")
             out_guide = gr.Markdown()
